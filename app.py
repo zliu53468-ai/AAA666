@@ -427,7 +427,7 @@ def predict_next_outcome(history_data):
             logger.error(f"ML prediction error: {e}")
     
     # ----------------------------------------------------
-    # 新增：長龍斷點的策略性觀望邏輯
+    # 新增：長龍斷點的策略性觀望邏輯 (調整)
     # ----------------------------------------------------
     run_trends = get_run_trends(history_data)
     if run_trends['is_long_run_breakpoint'] and run_trends['current_run_length'] == 1:
@@ -441,16 +441,17 @@ def predict_next_outcome(history_data):
         }
 
     # 選擇最佳結果 (如果沒有策略性觀望)
-    if 'ml' in results and results['ml']['confidence'] > 0.4:
+    if 'ml' in results and results['ml']['confidence'] > 0.4: # 降低信心度閾值，更容易建議下注
         return results['ml']
-    elif 'markov' in results and results['markov']['confidence'] > 0.4:
+    elif 'markov' in results and results['markov']['confidence'] > 0.4: # 降低信心度閾值
         return results['markov']
     else:
+        # 如果都沒有達到高信心度，仍建議觀望，但給出理由
         return {
             "prediction": "OBSERVE",
             "probabilities": {'B': 1/3, 'P': 1/3, 'T': 1/3},
             "confidence": 1/3,
-            "source": "observe"
+            "source": "low_confidence_default_observe" # 增加觀望原因
         }
 
 # Input validation
@@ -604,30 +605,44 @@ def get_recommendation():
     recommendation_text = ""
     bet_amount_text = ""
 
+    # 調整信心度閾值，讓 AI 更常給出下注建議
+    # 新的信心度閾值為 0.40
+    CONFIDENCE_THRESHOLD_LIGHT_BET = 0.40
+    CONFIDENCE_THRESHOLD_OBSERVE_LOW_CONFIDENCE = 0.30 # 更低的閾值，用來區分極低信心度
+
     if source_model == "strategic_observe_breakpoint":
-        # 如果是策略性觀望（長龍斷點），提供更詳細的建議
         trend_info = result.get("trend_info", {})
         last_breakpoint_type = trend_info.get('last_breakpoint_type')
-        reverse_bet_direction = None
+        reverse_bet_direction_chinese = None
+        reverse_bet_direction_english = None
 
         if last_breakpoint_type == 'B':
-            reverse_bet_direction = '閒'
+            reverse_bet_direction_chinese = '閒'
+            reverse_bet_direction_english = 'P'
         elif last_breakpoint_type == 'P':
-            reverse_bet_direction = '莊'
+            reverse_bet_direction_chinese = '莊'
+            reverse_bet_direction_english = 'B'
 
-        if reverse_bet_direction:
-            recommendation_text = f"長龍斷點！前長龍為 {last_breakpoint_type}，建議觀望，可考慮反押 {reverse_bet_direction}。"
+        if reverse_bet_direction_chinese:
+            recommendation_text = f"長龍斷點！前長龍為 {last_breakpoint_type}，建議觀望，可考慮反押 {reverse_bet_direction_chinese} ({reverse_bet_direction_english})。"
+            bet_amount_text = "Small (Cautious)" # 建議非常小的下注
         else:
             recommendation_text = "長龍斷點！趨勢不明，建議觀望。"
-        bet_amount_text = "No bet" # 長龍斷點通常建議不輕易下注，故維持 No bet
-    elif prediction == "OBSERVE":
-        recommendation_text = "Wait and observe"
+            bet_amount_text = "No bet" # 依然保守
+    elif prediction == "OBSERVE": # 如果 AI 預測就是 OBSERVE
+        if source_model == "low_confidence_default_observe":
+            recommendation_text = "AI 信心度不足，建議觀望。"
+        else:
+            recommendation_text = "目前趨勢不明顯，建議觀望。"
         bet_amount_text = "No bet"
-    elif confidence < 0.45: # 稍微提高觀望門檻
-        recommendation_text = "Observe (Low Confidence)"
+    elif confidence < CONFIDENCE_THRESHOLD_OBSERVE_LOW_CONFIDENCE: # 極低信心度
+        recommendation_text = "AI 信心度極低，建議觀望。"
         bet_amount_text = "No bet"
-    else:
-        recommendation_text = f"Light bet on {prediction}"
+    elif confidence < CONFIDENCE_THRESHOLD_LIGHT_BET: # 略低於「輕微下注」閾值，但高於極低信心
+        recommendation_text = f"AI 信心度一般，可考慮輕微下注 {prediction}。"
+        bet_amount_text = "Very Small"
+    else: # 信心度足夠進行輕微下注
+        recommendation_text = f"AI 建議下注 {prediction}。"
         bet_amount_text = "Small"
     
     return jsonify({
