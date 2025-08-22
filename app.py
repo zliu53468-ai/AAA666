@@ -76,6 +76,7 @@ MARKOV_LOOK_BACK = 2
 MIN_TRAINING_DATA = 20
 MAX_HISTORY_SIZE = 3000  # Reduced for memory efficiency
 LONG_RUN_THRESHOLD = 5 # 定義長龍的最小長度
+TREND_FOLLOW_START_THRESHOLD = 3 # 新增: 當連勝達到3局時，考慮跟隨趨勢
 
 # Simplified Game History
 class GameHistory:
@@ -369,7 +370,7 @@ def load_simple_models():
         return False
 
 def predict_next_outcome(history_data):
-    """預測下一個結果，加入長龍斷點的策略性觀望"""
+    """預測下一個結果，加入長龍預測與斷點判斷的策略性觀望"""
     # 如果模型尚未初始化，則嘗試載入模型
     if not model_manager.is_initialized:
         load_simple_models()
@@ -427,31 +428,113 @@ def predict_next_outcome(history_data):
             logger.error(f"ML prediction error: {e}")
     
     # ----------------------------------------------------
-    # 新增：長龍斷點的策略性觀望邏輯 (調整)
+    # 新增：長龍預測與斷點判斷的策略
     # ----------------------------------------------------
     run_trends = get_run_trends(history_data)
+    
+    # 策略 1: 長龍斷點後的第一個結果 (反應式觀望)
+    # 如果是長龍斷點，且當前長度為1 (即剛剛斷龍)，則建議觀望
     if run_trends['is_long_run_breakpoint'] and run_trends['current_run_length'] == 1:
         logger.info(f"Detected long run breakpoint for {run_trends['last_breakpoint_type']} (length {run_trends['last_breakpoint_length']}). Suggesting OBSERVE.")
         return {
             "prediction": "OBSERVE",
-            "probabilities": {'B': 1/3, 'P': 1/3, 'T': 1/3}, # 在觀望時給予平均機率
+            "probabilities": {'B': 1/3, 'P': 1/3, 'T': 1/3}, 
             "confidence": 0.35, # 稍微降低信心度，表示不確定
             "source": "strategic_observe_breakpoint",
             "trend_info": run_trends # 將趨勢資訊一同返回
         }
 
-    # 選擇最佳結果 (如果沒有策略性觀望)
-    if 'ml' in results and results['ml']['confidence'] > 0.4: # 降低信心度閾值，更容易建議下注
-        return results['ml']
-    elif 'markov' in results and results['markov']['confidence'] > 0.4: # 降低信心度閾值
-        return results['markov']
-    else:
-        # 如果都沒有達到高信心度，仍建議觀望，但給出理由
+    # 策略 2: 預測長龍的延續或形成 (主動跟隨趨勢)
+    # 如果當前連勝達到一定長度 (例如 3-4 局), 且未達長龍閾值 (LONG_RUN_THRESHOLD = 5)
+    if run_trends['current_run_length'] >= TREND_FOLLOW_START_THRESHOLD and run_trends['current_run_length'] < LONG_RUN_THRESHOLD:
+        main_pred_result = None
+        main_pred_confidence = 0
+        source_model_used = "trend_follow_no_ai_match" # 預設為趨勢跟隨，但AI沒有明確預測
+
+        # 檢查 ML/Markov 預測是否與當前走勢一致
+        if 'ml' in results and results['ml']['prediction'] == run_trends['current_run_type']:
+            main_pred_result = results['ml']['prediction']
+            main_pred_confidence = results['ml']['confidence']
+            source_model_used = "ml_plus_trend"
+        elif 'markov' in results and results['markov']['prediction'] == run_trends['current_run_type']:
+            main_pred_result = results['markov']['prediction']
+            main_pred_confidence = results['markov']['confidence']
+            source_model_used = "markov_plus_trend"
+        
+        # 如果 AI 預測與當前趨勢一致，且信心度還可以，就建議跟隨
+        if main_pred_result and main_pred_confidence > 0.4: # 稍微提高信心度要求
+            return {
+                "prediction": main_pred_result,
+                "probabilities": results.get('ml', results.get('markov', {'probabilities': {'B': 1/3, 'P': 1/3, 'T': 1/3}}))['probabilities'],
+                "confidence": main_pred_confidence * 1.1, # 稍微增強信心
+                "source": source_model_used + "_strong_follow",
+                "trend_info": run_trends
+            }
+        else: # 如果 ML/Markov 沒有明確預測，或信心度不高，但趨勢明確，仍建議輕微跟隨
+            return {
+                "prediction": run_trends['current_run_type'],
+                "probabilities": {'B': 1/3, 'P': 1/3, 'T': 1/3}, # 因為AI信心不高，機率設為平均
+                "confidence": 0.38, # 略高於觀望閾值
+                "source": source_model_used, # trend_follow_weak_ai 或 trend_follow_no_ai_match
+                "trend_info": run_trends
+            }
+
+
+    # 策略 3: 預測長龍斷點 (主動反向操作或觀望)
+    # 如果當前連勝已經很長 (例如 >= 5)，考慮斷點
+    if run_trends['current_run_length'] >= LONG_RUN_THRESHOLD:
+        # 尋找與當前長龍相反的預測
+        opposite_pred_type = 'P' if run_trends['current_run_type'] == 'B' else ('B' if run_trends['current_run_type'] == 'P' else None)
+        
+        if opposite_pred_type: # 只有在莊閒之間才考慮反向
+            ml_opposite_confidence = results.get('ml', {}).get('probabilities', {}).get(opposite_pred_type, 0)
+            markov_opposite_confidence = results.get('markov', {}).get('probabilities', {}).get(opposite_pred_type, 0)
+
+            BREAKPOINT_ANTICIPATION_CONFIDENCE = 0.35 # AI對反向結果的信心度閾值
+            # 如果 ML 或 Markov 對相反結果有足夠信心 (例如 > 35%)，則建議反押
+            if ml_opposite_confidence > BREAKPOINT_ANTICIPATION_CONFIDENCE or markov_opposite_confidence > BREAKPOINT_ANTICIPATION_CONFIDENCE:
+                # 選擇信心度更高的反向預測
+                if ml_opposite_confidence > markov_opposite_confidence:
+                    return {
+                        "prediction": opposite_pred_type,
+                        "probabilities": results.get('ml', {}).get('probabilities', {'B': 1/3, 'P': 1/3, 'T': 1/3}),
+                        "confidence": ml_opposite_confidence * 0.9, # 稍微降低信心，因為是反向
+                        "source": "ml_anticipate_breakpoint",
+                        "trend_info": run_trends
+                    }
+                else:
+                    return {
+                        "prediction": opposite_pred_type,
+                        "probabilities": results.get('markov', {}).get('probabilities', {'B': 1/3, 'P': 1/3, 'T': 1/3}),
+                        "confidence": markov_opposite_confidence * 0.9,
+                        "source": "markov_anticipate_breakpoint",
+                        "trend_info": run_trends
+                    }
+        
+        # 如果沒有明確的反向預測，但長龍已形成，則建議觀望
         return {
             "prediction": "OBSERVE",
             "probabilities": {'B': 1/3, 'P': 1/3, 'T': 1/3},
-            "confidence": 1/3,
-            "source": "low_confidence_default_observe" # 增加觀望原因
+            "confidence": 0.30, # 更低的信心度，強調觀望
+            "source": "long_run_no_clear_breakpoint_signal",
+            "trend_info": run_trends
+        }
+
+    # ----------------------------------------------------
+    # 預設行為 (如果沒有觸發上述特殊策略)
+    # ----------------------------------------------------
+    # 調整信心度閾值，讓 AI 更常給出下注建議
+    DEFAULT_PREDICT_CONFIDENCE_THRESHOLD = 0.38 
+    if 'ml' in results and results['ml']['confidence'] > DEFAULT_PREDICT_CONFIDENCE_THRESHOLD:
+        return results['ml']
+    elif 'markov' in results and results['markov']['confidence'] > DEFAULT_PREDICT_CONFIDENCE_THRESHOLD:
+        return results['markov']
+    else:
+        return {
+            "prediction": "OBSERVE",
+            "probabilities": {'B': 1/3, 'P': 1/3, 'T': 1/3},
+            "confidence": 0.30, # 降低預設觀望時的信心度
+            "source": "low_confidence_default_observe"
         }
 
 # Input validation
@@ -490,7 +573,7 @@ def home():
     return jsonify({
         "message": "Baccarat Prediction API (Koyeb Optimized)",
         "status": "running",
-        "version": "2.1 (with trend analysis)"
+        "version": "2.2 (Proactive Trend Analysis)" # 更新版本號
     })
 
 @app.route('/predict', methods=['POST'])
@@ -568,7 +651,7 @@ def status():
         "is_initialized": model_manager.is_initialized,
         "is_training": model_manager.get_training_status(),
         "memory_optimized": True,
-        "version": "2.1 (with trend analysis)"
+        "version": "2.2 (Proactive Trend Analysis)" # 更新版本號
     })
 
 @app.route('/train', methods=['POST'])
@@ -590,7 +673,7 @@ def train_model_endpoint():
 @app.route('/recommendation', methods=['POST'])
 @handle_errors
 def get_recommendation():
-    """取得下注建議，加入長龍斷點的反向下注考量"""
+    """取得下注建議，加入長龍預測與斷點判斷的策略性觀望"""
     data = request.get_json()
     if not data:
         return jsonify({"error": "Please provide JSON data"}), 400
@@ -601,17 +684,19 @@ def get_recommendation():
     prediction = result["prediction"]
     confidence = result["confidence"]
     source_model = result["source"]
-    
+    trend_info = result.get("trend_info", {}) # Get trend_info if available
+
     recommendation_text = ""
     bet_amount_text = ""
 
-    # 調整信心度閾值，讓 AI 更常給出下注建議
-    # 新的信心度閾值為 0.40
-    CONFIDENCE_THRESHOLD_LIGHT_BET = 0.40
-    CONFIDENCE_THRESHOLD_OBSERVE_LOW_CONFIDENCE = 0.30 # 更低的閾值，用來區分極低信心度
+    # 調整信心度閾值
+    CONFIDENCE_THRESHOLD_LIGHT_BET = 0.40 # 信心度高於此，建議輕微下注
+    CONFIDENCE_THRESHOLD_VERY_LIGHT_BET = 0.35 # 信心度高於此，建議非常輕微下注 (用於趨勢跟隨)
+    CONFIDENCE_THRESHOLD_OBSERVE_LOW_CONFIDENCE = 0.30 # 低於此，建議觀望
+
+    current_pred_chinese = "莊" if prediction == 'B' else ("閒" if prediction == 'P' else "和")
 
     if source_model == "strategic_observe_breakpoint":
-        trend_info = result.get("trend_info", {})
         last_breakpoint_type = trend_info.get('last_breakpoint_type')
         reverse_bet_direction_chinese = None
         reverse_bet_direction_english = None
@@ -625,24 +710,56 @@ def get_recommendation():
 
         if reverse_bet_direction_chinese:
             recommendation_text = f"長龍斷點！前長龍為 {last_breakpoint_type}，建議觀望，可考慮反押 {reverse_bet_direction_chinese} ({reverse_bet_direction_english})。"
-            bet_amount_text = "Small (Cautious)" # 建議非常小的下注
+            bet_amount_text = "No bet / Very Small" # 在斷點後依然保守
         else:
             recommendation_text = "長龍斷點！趨勢不明，建議觀望。"
-            bet_amount_text = "No bet" # 依然保守
-    elif prediction == "OBSERVE": # 如果 AI 預測就是 OBSERVE
+            bet_amount_text = "No bet"
+
+    elif "trend_follow" in source_model: # 新增：跟隨趨勢的建議
+        current_run_length = trend_info.get('current_run_length', 0)
+        
+        if "strong_follow" in source_model:
+            recommendation_text = f"趨勢強勁！建議跟隨 {current_pred_chinese} ({prediction})，已連開 {current_run_length} 局。"
+            bet_amount_text = "Small"
+        else: # weak_ai or no_ai_match
+            recommendation_text = f"趨勢正在形成！建議輕微跟隨 {current_pred_chinese} ({prediction})，已連開 {current_run_length} 局。"
+            bet_amount_text = "Very Small"
+        
+    elif "anticipate_breakpoint" in source_model: # 新增：預測斷點的建議
+        opposite_bet_direction_chinese = "莊" if prediction == 'B' else ("閒" if prediction == 'P' else "") # prediction here is the *opposite*
+        opposite_bet_direction_english = prediction # prediction is 'B' or 'P'
+        long_run_type = trend_info.get('current_run_type')
+        long_run_length = trend_info.get('current_run_length', 0)
+        
+        if opposite_bet_direction_chinese: # 確保有反向類型
+            recommendation_text = f"長龍 ({long_run_type} 已連開 {long_run_length} 局) 可能斷纜！建議輕微反押 {opposite_bet_direction_chinese} ({opposite_bet_direction_english})。"
+            bet_amount_text = "Very Small (Risk)" # 反押風險較高，建議小額
+        else: # 例如和局的長龍沒有明確反向
+            recommendation_text = f"長龍 ({long_run_type} 已連開 {long_run_length} 局) 可能斷纜，但趨勢不明。建議觀望。"
+            bet_amount_text = "No bet"
+
+
+    elif source_model == "long_run_no_clear_breakpoint_signal": # 長龍但AI無反向信心
+        long_run_type = trend_info.get('current_run_type')
+        long_run_length = trend_info.get('current_run_length', 0)
+        recommendation_text = f"長龍 ({long_run_type} 已連開 {long_run_length} 局) 延續中，但無明確反向信號。建議觀望。"
+        bet_amount_text = "No bet"
+
+    elif prediction == "OBSERVE": # 預設的觀望
         if source_model == "low_confidence_default_observe":
             recommendation_text = "AI 信心度不足，建議觀望。"
-        else:
+        else: # 這是原始的OBSERVE
             recommendation_text = "目前趨勢不明顯，建議觀望。"
         bet_amount_text = "No bet"
+    
     elif confidence < CONFIDENCE_THRESHOLD_OBSERVE_LOW_CONFIDENCE: # 極低信心度
         recommendation_text = "AI 信心度極低，建議觀望。"
         bet_amount_text = "No bet"
     elif confidence < CONFIDENCE_THRESHOLD_LIGHT_BET: # 略低於「輕微下注」閾值，但高於極低信心
-        recommendation_text = f"AI 信心度一般，可考慮輕微下注 {prediction}。"
+        recommendation_text = f"AI 信心度一般，可考慮輕微下注 {current_pred_chinese} ({prediction})。"
         bet_amount_text = "Very Small"
     else: # 信心度足夠進行輕微下注
-        recommendation_text = f"AI 建議下注 {prediction}。"
+        recommendation_text = f"AI 建議下注 {current_pred_chinese} ({prediction})。"
         bet_amount_text = "Small"
     
     return jsonify({
